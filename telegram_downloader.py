@@ -262,6 +262,120 @@ class TelegramDownloader:
         self.logger.debug(f"Adding delay of {delay:.2f} seconds")
         time.sleep(delay)
 
+    async def download_media_with_progress(
+        self,
+        message,
+        file_path: Path,
+        chunk_size: int = 1024 * 1024,  # 1MB chunks
+        max_concurrent_chunks: int = 4,
+    ) -> Optional[Path]:
+        """
+        Download media from Telegram with progress monitoring and speed optimization.
+
+        Args:
+            message: Telethon message object containing the media
+            file_path: Path where to save the downloaded file
+            chunk_size: Size of each chunk in bytes
+            max_concurrent_chunks: Maximum number of concurrent download tasks
+
+        Returns:
+            Path to downloaded file if successful, None otherwise
+        """
+        try:
+            start_time = time.time()
+            total_size = message.file.size
+            downloaded = 0
+
+            self.logger.info(
+                f"Starting download of {total_size / (1024*1024):.2f} MB: {file_path.name}"
+            )
+
+            async def download_chunk(offset: int, chunk_size: int) -> Optional[bytes]:
+                try:
+                    return await self.client.download_media(
+                        message, file=bytes, offset=offset, limit=chunk_size
+                    )
+                except Exception as e:
+                    self.logger.error(
+                        f"Error downloading chunk at offset {offset}: {e}"
+                    )
+                    return None
+
+            # Create chunks list
+            chunks = []
+            offset = 0
+            while offset < total_size:
+                current_chunk_size = min(chunk_size, total_size - offset)
+                chunks.append((offset, current_chunk_size))
+                offset += current_chunk_size
+
+            # Download chunks with semaphore to limit concurrency
+            sem = asyncio.Semaphore(max_concurrent_chunks)
+
+            async def download_chunk_with_semaphore(offset: int, size: int):
+                async with sem:
+                    return await download_chunk(offset, size)
+
+            # Start concurrent downloads
+            tasks = [
+                download_chunk_with_semaphore(offset, size) for offset, size in chunks
+            ]
+
+            # Create the output file
+            with open(file_path, "wb") as f:
+                for i, chunk_data in enumerate(await asyncio.gather(*tasks)):
+                    if chunk_data:
+                        f.write(chunk_data)
+                        downloaded += len(chunk_data)
+
+                        # Calculate and display progress
+                        elapsed = time.time() - start_time
+                        speed = downloaded / (1024 * 1024 * elapsed)  # MB/s
+                        progress = (downloaded / total_size) * 100
+
+                        self.logger.info(
+                            f"Progress: {progress:.1f}% | "
+                            f"Speed: {speed:.2f} MB/s | "
+                            f"Downloaded: {downloaded/(1024*1024):.1f}MB"
+                        )
+
+            total_elapsed = time.time() - start_time
+            avg_speed = (total_size / (1024 * 1024)) / total_elapsed
+            self.logger.info(
+                f"Download completed: {file_path.name} in {total_elapsed:.1f}s "
+                f"(avg: {avg_speed:.2f} MB/s)"
+            )
+            return file_path
+
+        except Exception as e:
+            self.logger.error(f"Failed to download {file_path.name}: {str(e)}")
+            return None
+
+    async def download_preview(self, message: Message, file_path: Path):
+        """Download preview image for the file."""
+        try:
+            base_filename = file_path.stem
+            # First try to find preview in channel
+            async for media_message in self.client.iter_messages(
+                message.chat_id,
+                search=base_filename,  # Search for messages containing the filename
+                filter=InputMessagesFilterPhotos,  # Filter for photos only
+                limit=5,  # Look at a few messages around to find the preview
+            ):
+                if media_message.photo and base_filename in media_message.text:
+                    image_path = file_path.parent / f"{base_filename}.jpg"
+                    await media_message.download_media(image_path)
+                    self.logger.info(
+                        f"Successfully downloaded preview image: {image_path.name}"
+                    )
+                    return
+
+            # If no preview in channel, try 3dsky.org
+            await self.get_preview_image(file_path.name)
+
+        except Exception as e:
+            self.logger.error(f"Failed to download preview: {str(e)}")
+
     async def download_files(
         self,
         channel_url: str,
@@ -357,41 +471,22 @@ class TelegramDownloader:
                                 continue
 
                             self.logger.info(f"Downloading: {message.file.name}")
-                            await message.download_media(file_path)
-                            downloaded_files.append(file_path)
-
-                            # Save last download info after successful download
-                            self.save_last_download_info(message)
-
-                            self.logger.info(
-                                f"Successfully downloaded: {message.file.name}"
+                            # Use the new optimized download method
+                            downloaded_file = await self.download_media_with_progress(
+                                message,
+                                file_path,
+                                chunk_size=1024 * 1024,  # 1MB chunks
+                                max_concurrent_chunks=4,
                             )
+                            if downloaded_file:
+                                downloaded_files.append(downloaded_file)
+                                self.save_last_download_info(message)
+                                self.logger.info(
+                                    f"Successfully downloaded: {message.file.name}"
+                                )
 
-                            # Then try to find and download the preview image
-                            base_filename = (
-                                file_path.stem
-                            )  # Get filename without extension
-                            async for media_message in self.client.iter_messages(
-                                message.chat_id,
-                                search=base_filename,  # Search for messages containing the filename
-                                filter=InputMessagesFilterPhotos,  # Filter for photos only
-                                limit=5,  # Look at a few messages around to find the preview
-                            ):
-                                if (
-                                    media_message.photo
-                                    and base_filename in media_message.text
-                                ):
-                                    image_path = (
-                                        file_path.parent / f"{base_filename}.jpg"
-                                    )
-                                    await media_message.download_media(image_path)
-                                    self.logger.info(
-                                        f"Successfully downloaded preview image: {image_path}"
-                                    )
-                                    break
-                                else:
-                                    # Get preview image
-                                    await self.get_preview_image(message.file.name)
+                                # Download preview image
+                                await self.download_preview(message, file_path)
 
                             self.random_delay()
                         except Exception as e:
