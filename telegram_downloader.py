@@ -45,49 +45,59 @@ class TelegramDownloader:
         """
         self.api_id = api_id
         self.api_hash = api_hash
-        download_path = os.getenv("DOWNLOAD_BASE_PATH", "/mnt/telegram-storage")
+        download_path = os.getenv("DOWNLOAD_BASE_PATH")
+        network_save = os.getenv("NETWORK_SAVE", "false").lower() == "true"
+
         # print(os.getenv("DOWNLOAD_BASE_PATH"))
 
         # print(download_path)
 
         # Verify network path format
-        if isinstance(download_path, str):
+
+        if network_save and isinstance(download_path, str):
             # Normalize path separators for Windows
             download_path = download_path.replace("/", "\\")
             if not download_path.startswith("\\\\"):
                 download_path = f"\\\\{download_path.lstrip('\\')}"
 
-        self.base_download_path = WindowsPath(download_path)
-        # print(self.base_download_path)
+        cleaned_path = download_path.strip().strip('"').strip("'").replace('r"', "")
+        self.base_download_path = Path(cleaned_path)
 
-        # Verify network connectivity
-        try:
-            # Try to ping the server first
-            server_ip = os.getenv("SERVER_IP")
-            socket.create_connection((server_ip, 445), timeout=5)  # 445 is SMB port
+        # self.base_download_path = WindowsPath(download_path.strip('"').strip("'"))
+        print(self.base_download_path)
 
-            # Test directory access
-            if not self.base_download_path.exists():
-                self.base_download_path.mkdir(parents=True, exist_ok=True)
-
-            # Test write permissions with a temporary file
-            test_file = self.base_download_path / ".write_test"
+        if network_save:
+            # Verify network connectivity
             try:
-                test_file.touch()
-                test_file.unlink()  # Remove test file
-            except PermissionError:
-                raise PermissionError(
-                    f"No write permission to {download_path}. Please check network share permissions."
+                # Try to ping the server first
+                server_ip = os.getenv("SERVER_IP")
+                socket.create_connection((server_ip, 445), timeout=5)  # 445 is SMB port
+
+                # Test directory access
+                if not self.base_download_path.exists():
+                    self.base_download_path.mkdir(parents=True, exist_ok=True)
+
+                # Test write permissions with a temporary file
+                test_file = self.base_download_path / ".write_test"
+                try:
+                    test_file.touch()
+                    test_file.unlink()  # Remove test file
+                except PermissionError:
+                    raise PermissionError(
+                        f"No write permission to {download_path}. Please check network share permissions."
+                    )
+
+            except socket.error:
+                raise ConnectionError(
+                    f"Cannot connect to network share at {server_ip}. Please check network connectivity."
+                )
+            except Exception as e:
+                raise Exception(
+                    f"Error accessing network path {download_path}: {str(e)}"
                 )
 
-        except socket.error:
-            raise ConnectionError(
-                f"Cannot connect to network share at {server_ip}. Please check network connectivity."
-            )
-        except Exception as e:
-            raise Exception(f"Error accessing network path {download_path}: {str(e)}")
-
         self.base_download_path.mkdir(parents=True, exist_ok=True)
+        # os.makedirs(self.base_download_path, exist_ok=True)
 
         self.current_channel_path: Optional[Path] = None
         self.last_download_file: Optional[Path] = None
@@ -134,18 +144,12 @@ class TelegramDownloader:
             self.logger.error(f"Failed to create channel directory: {str(e)}")
             raise
 
-    # def verify_network_access(self) -> bool:
-    #     """Verify network access is still available."""
-    #     try:
-    #         socket.create_connection(("192.168.222.110", 445), timeout=5)
-    #         return os.access(self.base_download_path, os.W_OK)
-    #     except (socket.error, OSError):
-    #         return False
     def verify_network_access(self) -> bool:
-        """FOR DOCKER Verify network access is still available."""
+        """Verify network access is still available."""
         try:
+            socket.create_connection(("192.168.222.110", 445), timeout=5)
             return os.access(self.base_download_path, os.W_OK)
-        except OSError:
+        except (socket.error, OSError):
             return False
 
     def get_last_download_info(self) -> Dict:
