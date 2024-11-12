@@ -1,0 +1,30 @@
+version: '3.8'
+
+services:
+  telegram-downloader:
+    build: .
+    volumes:
+      - /etc/localtime:/etc/localtime:ro  # Sync container time with host
+      - ./data:/app/data  # For persistent storage
+      - type: volume
+        source: session-data
+        target: /root/.local/share/TelegramDownloader
+    environment:
+      - TZ=UTC
+    env_file:
+      - .env
+    restart: unless-stopped
+    networks:
+      - host
+    # Required for network share access
+    privileged: true
+    cap_add:
+      - SYS_ADMIN
+      - DAC_READ_SEARCH
+
+volumes:
+  session-data:
+
+networks:
+  host:
+    driver: host
