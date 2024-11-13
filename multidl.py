@@ -255,13 +255,15 @@ class TelegramDownloader:
                 if reference_message_id is None:
                     # If reference file not found, continue with normal processing
                     self.logger.info(
-                        f"Continuing with last download file : {last_download.get("file_name")}"
+                        f"Did not find given message , Continuing with last download file : {last_download.get("file_name")}"
                     )
                     reference_message_id = last_message_id
                 else:
                     self.logger.info(
                         f"Found reference message ID: {reference_message_id}"
                     )
+            else:
+                reference_message_id = last_message_id
 
             if date_filter and date_filter.tzinfo is None:
                 date_filter = pytz.UTC.localize(date_filter)
