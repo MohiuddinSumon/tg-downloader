@@ -1,11 +1,13 @@
+import asyncio
 import json
 import logging
 import os
 import random
 import time
+from asyncio import Queue, Task
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import pytz
 import requests
@@ -23,7 +25,8 @@ from telethon.tl.types import (
 
 class TelegramDownloader:
     """
-    TelegramDownloader class for downloading files from Telegram channels."""
+    TelegramDownloader class for downloading files from Telegram channels with concurrent downloads.
+    """
 
     def __init__(
         self,
@@ -34,6 +37,9 @@ class TelegramDownloader:
             "DOWNLOAD_BASE_PATH", "./downloads"
         ),
         log_level: int = logging.INFO,
+        max_concurrent_downloads: int = 3,
+        min_delay: float = 3.0,
+        max_delay: float = 10.0,
     ):
         """
         Initialize the Telegram downloader.
@@ -44,6 +50,9 @@ class TelegramDownloader:
             session_name: Name for the Telegram session
             download_path: Path where files will be saved
             log_level: Logging level (default: logging.INFO)
+            max_concurrent_downloads: Maximum number of concurrent downloads (default: 3)
+            min_delay: Minimum delay between downloads (seconds)
+            max_delay: Maximum delay between downloads (seconds)
         """
         self.api_id = api_id
         self.api_hash = api_hash
@@ -53,6 +62,11 @@ class TelegramDownloader:
         self.last_download_file: Optional[Path] = None
         self.session_name = session_name
         self.session_file = Path(f"{session_name}.session")
+        self.max_concurrent_downloads = max_concurrent_downloads
+        self.download_queue: Queue = Queue()
+        self.active_downloads: Set[Task] = set()
+        self.min_delay = min_delay
+        self.max_delay = max_delay
 
         # Setup logging
         logging.basicConfig(
@@ -64,10 +78,256 @@ class TelegramDownloader:
             ],
         )
         self.logger = logging.getLogger(__name__)
-
-        # Initialize client with unique session name to avoid conflicts
-        # unique_session = f"{session_name}_{os.getpid()}"
         self.client = TelegramClient(session_name, api_id, api_hash)
+
+    async def download_preview_image(
+        self, message: Message, file_path: Path
+    ) -> Optional[Path]:
+        """Download preview image from the message or from 3dsky.org."""
+        base_filename = file_path.stem
+
+        try:
+            # First try to find preview in Telegram
+            async for media_message in self.client.iter_messages(
+                message.chat_id,
+                search=base_filename,
+                filter=InputMessagesFilterPhotos,
+                limit=5,
+            ):
+                if media_message.photo and base_filename in (media_message.text or ""):
+                    image_path = file_path.parent / f"{base_filename}.jpg"
+                    await media_message.download_media(image_path)
+                    self.logger.info(
+                        f"Successfully downloaded Telegram preview image: {image_path}"
+                    )
+                    return image_path
+
+            # If no preview found in Telegram, try 3dsky.org
+            return await self.get_preview_image(file_path.name)
+
+        except Exception as e:
+            self.logger.error(
+                f"Error downloading preview image for {base_filename}: {str(e)}"
+            )
+            return None
+
+    async def download_worker(self, worker_id: int):
+        """Worker function to process downloads from the queue."""
+        while True:
+            try:
+
+                # Get the next download task from the queue
+                message, file_path = await self.download_queue.get()
+
+                try:
+                    # Add delay before starting new download
+                    self.logger.info(
+                        f"Worker {worker_id} waiting for delay before starting download..."
+                    )
+                    await self.random_delay()
+
+                    self.logger.info(
+                        f"Worker {worker_id} downloading: {message.file.name} , id: {message.id}, date: {message.date}"
+                    )
+
+                    def progress_callback(current, total):
+                        current_mb = current / (1024 * 1024)
+                        total_mb = total / (1024 * 1024)
+                        print(
+                            f"Worker {worker_id} - {message.file.name}: {current_mb:.2f}MB/{total_mb:.2f}MB ({(current/total)*100:.1f}%)"
+                        )
+
+                    # Download the file
+                    await message.download_media(
+                        file_path, progress_callback=progress_callback
+                    )
+
+                    # Save download info
+                    self.save_last_download_info(message)
+
+                    # Add delay before preview download
+                    self.logger.info(
+                        f"Worker {worker_id} waiting for delay before preview download..."
+                    )
+                    await self.random_delay()
+
+                    # Download preview image
+                    preview_path = await self.download_preview_image(message, file_path)
+                    if preview_path:
+                        self.logger.info(
+                            f"Worker {worker_id} downloaded preview: {preview_path}"
+                        )
+                    else:
+                        self.logger.warning(
+                            f"Worker {worker_id} couldn't find preview for: {message.file.name}"
+                        )
+
+                    self.logger.info(
+                        f"Worker {worker_id} completed: {message.file.name}"
+                    )
+
+                except Exception as e:
+                    self.logger.error(
+                        f"Worker {worker_id} failed to download {message.file.name}: {str(e)}"
+                    )
+
+                finally:
+                    # Mark the task as done
+                    self.download_queue.task_done()
+
+            except Exception as e:
+                self.logger.error(f"Worker {worker_id} encountered error: {str(e)}")
+                await asyncio.sleep(1)  # Prevent tight loop on persistent errors
+
+    async def find_reference_message(
+        self, channel, file_name_filter: str
+    ) -> Tuple[Optional[Message], Optional[int]]:
+        """
+        Find a specific message containing the file name to use as a reference point.
+
+        Returns:
+            Tuple of (reference message if found, message ID to start from)
+        """
+
+        try:
+            async for message in self.client.iter_messages(
+                channel,
+                filter=InputMessagesFilterDocument,
+                search=file_name_filter,
+                limit=10,
+            ):
+                if (
+                    message.file
+                    and file_name_filter.lower() in message.file.name.lower()
+                ):
+                    self.logger.info(
+                        f"Found reference file: {message.file.name} with message ID: {message.id} , message date: {message.date}"
+                    )
+                    return message, message.id
+
+            self.logger.warning(
+                f"Reference file '{file_name_filter}' not found in channel"
+            )
+            return None, None
+
+        except Exception as e:
+            self.logger.error(f"Error while searching for reference file: {str(e)}")
+            return None, None
+
+    async def download_files(
+        self,
+        channel_url: str,
+        file_name_filter: Optional[str] = None,
+        date_filter: Optional[datetime] = None,
+        before_after: str = "after",
+        limit: Optional[int] = None,
+    ) -> List[Path]:
+        """
+        Download files concurrently from the specified channel with filtering options.
+        """
+        downloaded_files = []
+        try:
+            channel = await self.client.get_entity(channel_url)
+            channel_name = channel.username or channel.title
+            self.setup_channel_directory(channel_name)
+
+            self.logger.info(f"Accessing channel: {channel.title}")
+
+            # Initialize download queue and workers
+            workers = []
+            for i in range(self.max_concurrent_downloads):
+                worker = asyncio.create_task(self.download_worker(i + 1))
+                workers.append(worker)
+
+            # Get last download info
+            last_download = self.get_last_download_info()
+            last_message_id = last_download.get("message_id", 0)
+
+            # Handle file name filtering and reference point
+            reference_message = None
+            reference_message_id = None
+
+            if file_name_filter:
+                self.logger.info(f"File name filter: {file_name_filter}")
+                reference_message, reference_message_id = (
+                    await self.find_reference_message(channel, file_name_filter)
+                )
+                if reference_message_id is None:
+                    # If reference file not found, continue with normal processing
+                    self.logger.info(
+                        f"Did not find given message , Continuing with last download file : {last_download.get("file_name")}"
+                    )
+                    reference_message_id = last_message_id
+                else:
+                    self.logger.info(
+                        f"Found reference message ID: {reference_message_id}"
+                    )
+            else:
+                reference_message_id = last_message_id
+
+            if date_filter and date_filter.tzinfo is None:
+                date_filter = pytz.UTC.localize(date_filter)
+
+            # Determine the correct message iteration parameters
+            iter_params = {
+                "limit": limit,
+                "filter": InputMessagesFilterDocument,
+                "reverse": before_after == "after",
+                # True for after (newer), False for before (older)
+            }
+
+            if reference_message_id:
+                if before_after == "before":
+                    # For "before", start from the reference ID and go backwards (older messages)
+                    iter_params["offset_id"] = reference_message_id
+                else:
+                    # For "after", start from the reference ID and go forwards (newer messages)
+                    # We need to add 1 to offset_id to exclude the reference message itself
+                    iter_params["offset_id"] = reference_message_id + 1
+
+                self.logger.info(
+                    f"Starting message iteration with parameters: {iter_params}"
+                )
+
+            async for message in self.client.iter_messages(channel, **iter_params):
+                if message.file and message.file.name.endswith(".zip"):
+                    # Apply filters
+                    if date_filter:
+                        message_date = message.date.replace(tzinfo=pytz.UTC)
+                        if (before_after == "after" and message_date < date_filter) or (
+                            before_after == "before" and message_date > date_filter
+                        ):
+                            continue
+
+                    file_path = self.current_channel_path / message.file.name
+
+                    # Skip if file already exists
+                    if file_path.exists():
+                        self.logger.info(
+                            f"File already exists, skipping: {message.file.name}"
+                        )
+                        downloaded_files.append(file_path)
+                        continue
+
+                    # Add download task to queue
+                    await self.download_queue.put((message, file_path))
+                    downloaded_files.append(file_path)
+
+            # Wait for all downloads to complete
+            await self.download_queue.join()
+
+            # Cancel worker tasks
+            for worker in workers:
+                worker.cancel()
+
+            # Wait for all workers to complete
+            await asyncio.gather(*workers, return_exceptions=True)
+
+        except Exception as e:
+            self.logger.error(f"Error during download process: {str(e)}")
+            raise
+
+        return downloaded_files
 
     def setup_channel_directory(self, channel_name: str):
         """Setup channel-specific directory and last download tracking file."""
@@ -179,164 +439,12 @@ class TelegramDownloader:
         except Exception as e:
             self.logger.error(f"Error during logout: {str(e)}")
 
-    def random_delay(self, min_seconds: float = 3.0, max_seconds: float = 10.0):
+    # def random_delay(self, min_seconds: float = 3.0, max_seconds: float = 10.0):
+    async def random_delay(self):
         """Add random delay to avoid detection."""
-        delay = random.uniform(min_seconds, max_seconds)
+        delay = random.uniform(self.min_delay, self.max_delay)
         self.logger.debug(f"Adding delay of {delay:.2f} seconds")
-        time.sleep(delay)
-
-    async def download_files(
-        self,
-        channel_url: str,
-        file_name_filter: Optional[str] = None,
-        date_filter: Optional[datetime] = None,
-        before_after: str = "after",
-        limit: Optional[int] = None,
-    ) -> List[Path]:
-        """
-        Download ZIP files from the specified channel with filtering options.
-
-        Args:
-            channel_url: URL or username of the Telegram channel
-            file_name_filter: Optional filter for file names
-            date_filter: Optional datetime to filter messages
-            before_after: "before" or "after" for date filtering
-            limit: Maximum number of files to download
-
-        Returns:
-            List of paths to downloaded files
-        """
-        downloaded_files = []
-        try:
-            channel = await self.client.get_entity(channel_url)
-            channel_name = channel.username or channel.title
-            self.setup_channel_directory(channel_name)
-
-            self.logger.info(f"Accessing channel: {channel.title}")
-
-            # Get last download info
-            last_download = self.get_last_download_info()
-            last_message_id = last_download.get("message_id", 0)
-            print(last_message_id)
-
-            # Ensure date_filter is timezone-aware if provided
-            if date_filter and date_filter.tzinfo is None:
-                date_filter = pytz.UTC.localize(date_filter)
-
-            async for message in self.client.iter_messages(
-                channel,
-                limit=limit,
-                filter=InputMessagesFilterDocument,
-                max_id=last_message_id,
-            ):
-                try:
-
-                    if message.file and message.file.name.endswith(".zip"):
-                        print(
-                            f"Got A File to download: {message.date}, {message.file.name}, {message.id}"
-                        )
-                        # Apply filters
-                        if date_filter:
-                            print(
-                                f"Applying Date Filter: Message Date: {message.date}, Filter Date:{date_filter}, Before/After: {before_after}"
-                            )
-
-                            message_date = message.date.replace(
-                                tzinfo=pytz.UTC
-                            )  # Ensure message date is UTC
-                            if (
-                                before_after == "after" and message_date < date_filter
-                            ) or (
-                                before_after == "before" and message_date > date_filter
-                            ):
-                                print(
-                                    f"IN FILTER {message_date}, {date_filter}, {message.file.name}"
-                                )
-                                continue
-
-                        if (
-                            file_name_filter
-                            and file_name_filter.lower()
-                            not in message.file.name.lower()
-                        ):
-                            continue
-
-                        # Use channel-specific directory for downloads
-                        file_path = self.current_channel_path / message.file.name
-
-                        try:
-                            # Skip if file already exists
-                            if file_path.exists():
-                                self.logger.info(
-                                    f"File already exists, skipping: {message.file.name}"
-                                )
-                                downloaded_files.append(file_path)
-                                continue
-
-                            self.logger.info(f"Downloading: {message.file.name}")
-
-                            def callback(current, total):
-                                current_mb = current / (1024 * 1024)
-                                total_mb = total / (1024 * 1024)
-
-                                print(
-                                    f"Downloaded {current_mb:.2f} MB out of {total_mb:.2f} MB: {(current / total) * 100:.2f}"
-                                )
-
-                            await message.download_media(
-                                file_path, progress_callback=callback
-                            )
-
-                            downloaded_files.append(file_path)
-
-                            # Save last download info after successful download
-                            self.save_last_download_info(message)
-
-                            self.logger.info(
-                                f"Successfully downloaded: {message.file.name}"
-                            )
-
-                            # Then try to find and download the preview image
-                            base_filename = (
-                                file_path.stem
-                            )  # Get filename without extension
-                            async for media_message in self.client.iter_messages(
-                                message.chat_id,
-                                search=base_filename,  # Search for messages containing the filename
-                                filter=InputMessagesFilterPhotos,  # Filter for photos only
-                                limit=5,  # Look at a few messages around to find the preview
-                            ):
-                                if (
-                                    media_message.photo
-                                    and base_filename in media_message.text
-                                ):
-                                    image_path = (
-                                        file_path.parent / f"{base_filename}.jpg"
-                                    )
-                                    await media_message.download_media(image_path)
-                                    self.logger.info(
-                                        f"Successfully downloaded preview image: {image_path}"
-                                    )
-                                    break
-                                else:
-                                    # Get preview image
-                                    await self.get_preview_image(message.file.name)
-
-                            self.random_delay()
-                        except Exception as e:
-                            self.logger.error(
-                                f"Failed to download {message.file.name}: {str(e)}"
-                            )
-                            continue
-                except Exception as e:
-                    self.logger.error(f"Error processing message: {str(e)}")
-                    continue
-
-        except Exception as e:
-            self.logger.error(f"Error during download process: {str(e)}")
-            raise
-
-        return downloaded_files
+        await asyncio.sleep(delay)
 
     async def get_preview_image(self, zip_filename: str) -> Optional[Path]:
         """
@@ -381,7 +489,7 @@ class TelegramDownloader:
             )
             image_response.raise_for_status()
 
-            preview_path = self.download_path / f"{file_base_name}_preview.jpg"
+            preview_path = self.current_channel_path / f"{file_base_name}_preview.jpg"
             with open(preview_path, "wb") as f:
                 for chunk in image_response.iter_content(8192):
                     f.write(chunk)
@@ -422,7 +530,18 @@ async def main():
     if not api_hash:
         api_hash = input("Enter your API HASH: ")
 
-    downloader = TelegramDownloader(api_id=int(api_id), api_hash=api_hash)
+    # Configure number of concurrent downloads
+    max_concurrent = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
+    min_delay = float(os.getenv("MIN_DELAY", "3"))
+    max_delay = float(os.getenv("MAX_DELAY", "10"))
+
+    downloader = TelegramDownloader(
+        api_id=int(api_id),
+        api_hash=api_hash,
+        max_concurrent_downloads=max_concurrent,
+        min_delay=min_delay,
+        max_delay=max_delay,
+    )
 
     try:
         # Connect using existing session or create new one
@@ -431,13 +550,15 @@ async def main():
             return
 
         channel_url = os.getenv("CHANNEL_URL") or input("Enter the channel URL: ")
+        file_filter = os.getenv("FILE_NAME_FILTER", None)
+        before_after = os.getenv("BEFORE_AFTER", "before")
 
         # Your download logic here
         downloaded_files = await downloader.download_files(
             channel_url=channel_url,
             date_filter=None,
-            file_name_filter=None,
-            before_after="before",
+            file_name_filter=file_filter,
+            before_after=before_after,
             limit=None,
         )
 

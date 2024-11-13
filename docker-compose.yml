@@ -2,29 +2,29 @@ version: '3.8'
 
 services:
   telegram-downloader:
-    build: .
-    volumes:
-      - /etc/localtime:/etc/localtime:ro  # Sync container time with host
-      - ./data:/app/data  # For persistent storage
-      - type: volume
-        source: session-data
-        target: /root/.local/share/TelegramDownloader
-    environment:
-      - TZ=UTC
+    build:
+      context: .
+      args:
+        - UID=${UID:-1000} # passes UID and GID to the container from .env
+        - GID=${GID:-1000}
+    container_name: telegram-downloader
     env_file:
       - .env
+    volumes:
+      # - ./downloader_session.session:/app/downloader_session.session  # Persist Telegram session
+      # - ${DOWNLOAD_BASE_PATH}:${DOWNLOAD_BASE_PATH}
+      # - HOST_PATH:CONTAINER_PATH
+      - type: bind
+        source: ./downloader_session.session #host path
+        target: /app/downloader_session.session #container path
+      - type: bind
+        source: ${DOWNLOAD_BASE_PATH}
+        target: ${DOWNLOAD_BASE_PATH} #they are same because actual files are downloaded in this path
+
     restart: unless-stopped
-    networks:
-      - host
-    # Required for network share access
-    privileged: true
-    cap_add:
-      - SYS_ADMIN
-      - DAC_READ_SEARCH
 
-volumes:
-  session-data:
 
-networks:
-  host:
-    driver: host
+    # user: "${UID}:${GID}"
+    # stdin_open: true  # Keep STDIN open
+    # tty: true        # Allocate a pseudo-TTY
+    # restart: "no"    # Don't restart automatically since we need user input
