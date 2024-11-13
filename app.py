@@ -274,7 +274,19 @@ class TelegramDownloader:
                                 continue
 
                             self.logger.info(f"Downloading: {message.file.name}")
-                            await message.download_media(file_path)
+
+                            def callback(current, total):
+                                current_mb = current / (1024 * 1024)
+                                total_mb = total / (1024 * 1024)
+
+                                print(
+                                    f"Downloaded {current_mb:.2f} MB out of {total_mb:.2f} MB: {(current / total) * 100:.2f}"
+                                )
+
+                            await message.download_media(
+                                file_path, progress_callback=callback
+                            )
+
                             downloaded_files.append(file_path)
 
                             # Save last download info after successful download
