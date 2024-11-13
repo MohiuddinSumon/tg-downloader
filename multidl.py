@@ -7,7 +7,7 @@ import time
 from asyncio import Queue, Task
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Union
+from typing import Dict, List, Optional, Tuple, Union
 
 import pytz
 import requests
@@ -127,7 +127,7 @@ class TelegramDownloader:
                     await self.random_delay()
 
                     self.logger.info(
-                        f"Worker {worker_id} downloading: {message.file.name}"
+                        f"Worker {worker_id} downloading: {message.file.name} , id: {message.id}, date: {message.date}"
                     )
 
                     def progress_callback(current, total):
@@ -179,6 +179,41 @@ class TelegramDownloader:
                 self.logger.error(f"Worker {worker_id} encountered error: {str(e)}")
                 await asyncio.sleep(1)  # Prevent tight loop on persistent errors
 
+    async def find_reference_message(
+        self, channel, file_name_filter: str
+    ) -> Tuple[Optional[Message], Optional[int]]:
+        """
+        Find a specific message containing the file name to use as a reference point.
+
+        Returns:
+            Tuple of (reference message if found, message ID to start from)
+        """
+
+        try:
+            async for message in self.client.iter_messages(
+                channel,
+                filter=InputMessagesFilterDocument,
+                search=file_name_filter,
+                limit=10,
+            ):
+                if (
+                    message.file
+                    and file_name_filter.lower() in message.file.name.lower()
+                ):
+                    self.logger.info(
+                        f"Found reference file: {message.file.name} with message ID: {message.id} , message date: {message.date}"
+                    )
+                    return message, message.id
+
+            self.logger.warning(
+                f"Reference file '{file_name_filter}' not found in channel"
+            )
+            return None, None
+
+        except Exception as e:
+            self.logger.error(f"Error while searching for reference file: {str(e)}")
+            return None, None
+
     async def download_files(
         self,
         channel_url: str,
@@ -208,15 +243,50 @@ class TelegramDownloader:
             last_download = self.get_last_download_info()
             last_message_id = last_download.get("message_id", 0)
 
+            # Handle file name filtering and reference point
+            reference_message = None
+            reference_message_id = None
+
+            if file_name_filter:
+                self.logger.info(f"File name filter: {file_name_filter}")
+                reference_message, reference_message_id = (
+                    await self.find_reference_message(channel, file_name_filter)
+                )
+                if reference_message_id is None:
+                    # If reference file not found, continue with normal processing
+                    self.logger.info(
+                        "Continuing with normal processing without reference point"
+                    )
+                else:
+                    self.logger.info(
+                        f"Found reference message ID: {reference_message_id}"
+                    )
+
             if date_filter and date_filter.tzinfo is None:
                 date_filter = pytz.UTC.localize(date_filter)
 
-            async for message in self.client.iter_messages(
-                channel,
-                limit=limit,
-                filter=InputMessagesFilterDocument,
-                max_id=last_message_id,
-            ):
+            # Determine the correct message iteration parameters
+            iter_params = {
+                "limit": limit,
+                "filter": InputMessagesFilterDocument,
+                "reverse": before_after == "after",
+                # True for after (newer), False for before (older)
+            }
+
+            if reference_message_id:
+                if before_after == "before":
+                    # For "before", start from the reference ID and go backwards (older messages)
+                    iter_params["offset_id"] = reference_message_id
+                else:
+                    # For "after", start from the reference ID and go forwards (newer messages)
+                    # We need to add 1 to offset_id to exclude the reference message itself
+                    iter_params["offset_id"] = reference_message_id + 1
+
+                self.logger.info(
+                    f"Starting message iteration with parameters: {iter_params}"
+                )
+
+            async for message in self.client.iter_messages(channel, **iter_params):
                 if message.file and message.file.name.endswith(".zip"):
                     # Apply filters
                     if date_filter:
@@ -225,12 +295,6 @@ class TelegramDownloader:
                             before_after == "before" and message_date > date_filter
                         ):
                             continue
-
-                    if (
-                        file_name_filter
-                        and file_name_filter.lower() not in message.file.name.lower()
-                    ):
-                        continue
 
                     file_path = self.current_channel_path / message.file.name
 
@@ -483,13 +547,15 @@ async def main():
             return
 
         channel_url = os.getenv("CHANNEL_URL") or input("Enter the channel URL: ")
+        file_filter = os.getenv("FILE_NAME_FILTER", None)
+        before_after = os.getenv("BEFORE_AFTER", "before")
 
         # Your download logic here
         downloaded_files = await downloader.download_files(
             channel_url=channel_url,
             date_filter=None,
-            file_name_filter=None,
-            before_after="before",
+            file_name_filter=file_filter,
+            before_after=before_after,
             limit=None,
         )
 
