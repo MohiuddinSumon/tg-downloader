@@ -3,11 +3,12 @@ import json
 import logging
 import os
 import random
+import signal
 import time
 from asyncio import Queue, Task
 from datetime import datetime
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple, Union
+from typing import Dict, List, Optional, Set, Tuple, Union
 
 import pytz
 import requests
@@ -68,6 +69,11 @@ class TelegramDownloader:
         self.min_delay = min_delay
         self.max_delay = max_delay
 
+        # for error handling
+        self.shutdown_event = asyncio.Event()
+        self.failed_downloads: Set[Path] = set()
+        self.in_progress_downloads: Dict[Path, datetime] = {}
+
         # Setup logging
         logging.basicConfig(
             level=log_level,
@@ -111,13 +117,48 @@ class TelegramDownloader:
             )
             return None
 
+    async def cleanup_incomplete_downloads(self):
+        """Clean up any incomplete or zero-byte downloads."""
+        if not self.current_channel_path:
+            return
+
+        self.logger.info("Cleaning up incomplete downloads...")
+
+        # Clean up files that were in progress
+        for file_path in self.in_progress_downloads.keys():
+            if file_path.exists():
+                try:
+                    if (
+                        file_path.stat().st_size == 0
+                        or file_path in self.failed_downloads
+                    ):
+                        file_path.unlink()
+                        self.logger.info(f"Removed incomplete download: {file_path}")
+
+                        # Also remove any associated preview file
+                        preview_path = file_path.parent / f"{file_path.stem}.jpg"
+                        if preview_path.exists():
+                            preview_path.unlink()
+                            self.logger.info(
+                                f"Removed associated preview: {preview_path}"
+                            )
+                except Exception as e:
+                    self.logger.error(f"Error cleaning up file {file_path}: {str(e)}")
+
     async def download_worker(self, worker_id: int):
         """Worker function to process downloads from the queue."""
-        while True:
+        while not self.shutdown_event.is_set():
             try:
-
                 # Get the next download task from the queue
-                message, file_path = await self.download_queue.get()
+                try:
+                    message, file_path = await asyncio.wait_for(
+                        self.download_queue.get(), timeout=5.0
+                    )
+                except asyncio.TimeoutError:
+                    continue
+
+                self.in_progress_downloads[file_path] = datetime.now()
+                success = False
 
                 try:
                     # Add delay before starting new download
@@ -125,10 +166,12 @@ class TelegramDownloader:
                         f"Worker {worker_id} waiting for delay before starting download..."
                     )
                     await self.random_delay()
-
                     self.logger.info(
-                        f"Worker {worker_id} downloading: {message.file.name} , id: {message.id}, date: {message.date}"
+                        f"Worker {worker_id} downloading: {message.file.name}"
                     )
+
+                    # Create temporary file path
+                    temp_file_path = file_path.with_suffix(f"{file_path.suffix}.tmp")
 
                     def progress_callback(current, total):
                         current_mb = current / (1024 * 1024)
@@ -137,41 +180,61 @@ class TelegramDownloader:
                             f"Worker {worker_id} - {message.file.name}: {current_mb:.2f}MB/{total_mb:.2f}MB ({(current/total)*100:.1f}%)"
                         )
 
-                    # Download the file
-                    await message.download_media(
-                        file_path, progress_callback=progress_callback
-                    )
+                    # Download to temporary file first (, progress_callback=progress_callback)
+                    await message.download_media(temp_file_path)
 
-                    # Save download info
-                    self.save_last_download_info(message)
+                    # Verify the download
+                    if (
+                        not temp_file_path.exists()
+                        or temp_file_path.stat().st_size == 0
+                    ):
+                        raise Exception("Download failed or file is empty")
 
+                    # If successful, rename to final filename
+                    temp_file_path.rename(file_path)
+
+                    # Download preview and save download info only if main file download succeeded
                     # Add delay before preview download
                     self.logger.info(
                         f"Worker {worker_id} waiting for delay before preview download..."
                     )
                     await self.random_delay()
-
-                    # Download preview image
                     preview_path = await self.download_preview_image(message, file_path)
+
                     if preview_path:
                         self.logger.info(
                             f"Worker {worker_id} downloaded preview: {preview_path}"
                         )
-                    else:
-                        self.logger.warning(
-                            f"Worker {worker_id} couldn't find preview for: {message.file.name}"
-                        )
 
-                    self.logger.info(
-                        f"Worker {worker_id} completed: {message.file.name}"
-                    )
+                    self.save_last_download_info(message)
+                    success = True
 
                 except Exception as e:
                     self.logger.error(
                         f"Worker {worker_id} failed to download {message.file.name}: {str(e)}"
                     )
+                    self.failed_downloads.add(file_path)
+                    # Signal shutdown if it's a connection error
+                    if "Connection" in str(e) or "NetworkError" in str(e):
+                        self.logger.error(
+                            "Network error detected, initiating shutdown..."
+                        )
+                        self.shutdown_event.set()
 
                 finally:
+                    # Cleanup if download failed
+                    if not success:
+                        for path in [file_path, temp_file_path]:
+                            try:
+                                if path.exists():
+                                    path.unlink()
+                                    self.logger.info(
+                                        f"Cleaned up failed download: {path}"
+                                    )
+                            except Exception as e:
+                                self.logger.error(f"Error cleaning up {path}: {str(e)}")
+
+                    del self.in_progress_downloads[file_path]
                     # Mark the task as done
                     self.download_queue.task_done()
 
@@ -226,6 +289,7 @@ class TelegramDownloader:
         Download files concurrently from the specified channel with filtering options.
         """
         downloaded_files = []
+        workers = []
         try:
             channel = await self.client.get_entity(channel_url)
             channel_name = channel.username or channel.title
@@ -234,7 +298,6 @@ class TelegramDownloader:
             self.logger.info(f"Accessing channel: {channel.title}")
 
             # Initialize download queue and workers
-            workers = []
             for i in range(self.max_concurrent_downloads):
                 worker = asyncio.create_task(self.download_worker(i + 1))
                 workers.append(worker)
@@ -290,6 +353,10 @@ class TelegramDownloader:
                 )
 
             async for message in self.client.iter_messages(channel, **iter_params):
+                if self.shutdown_event.is_set():
+                    self.logger.info("Shutdown event detected during message iteration")
+                    break
+
                 if message.file and message.file.name.endswith(".zip"):
                     # Apply filters
                     if date_filter:
@@ -301,8 +368,8 @@ class TelegramDownloader:
 
                     file_path = self.current_channel_path / message.file.name
 
-                    # Skip if file already exists
-                    if file_path.exists():
+                    # Skip if file already exists and non empty
+                    if file_path.exists() and file_path.stat().st_size > 0:
                         self.logger.info(
                             f"File already exists, skipping: {message.file.name}"
                         )
@@ -313,19 +380,42 @@ class TelegramDownloader:
                     await self.download_queue.put((message, file_path))
                     downloaded_files.append(file_path)
 
-            # Wait for all downloads to complete
-            await self.download_queue.join()
+            # Now wait for downloads to complete or shutdown
+            self.logger.info(
+                "All messages queued, waiting for downloads to complete..."
+            )
 
-            # Cancel worker tasks
-            for worker in workers:
-                worker.cancel()
+            while not self.download_queue.empty():
+                if self.shutdown_event.is_set():
+                    self.logger.info("Shutdown requested, stopping downloads...")
+                    break
+                await asyncio.sleep(1)
 
-            # Wait for all workers to complete
-            await asyncio.gather(*workers, return_exceptions=True)
+            # Wait for remaining downloads with timeout
+            try:
+                await asyncio.wait_for(self.download_queue.join(), timeout=30.0)
+            except asyncio.TimeoutError:
+                self.logger.warning("Timeout waiting for downloads to complete")
+                self.shutdown_event.set()
 
         except Exception as e:
             self.logger.error(f"Error during download process: {str(e)}")
-            raise
+            self.shutdown_event.set()
+        finally:
+            # Cancel all workers
+            for worker in workers:
+                worker.cancel()
+
+            # Wait for workers to complete
+            await asyncio.gather(*workers, return_exceptions=True)
+
+            # Clean up any incomplete downloads
+            await self.cleanup_incomplete_downloads()
+
+            # Reset state
+            self.shutdown_event.clear()
+            self.failed_downloads.clear()
+            self.in_progress_downloads.clear()
 
         return downloaded_files
 
@@ -421,6 +511,8 @@ class TelegramDownloader:
     async def disconnect(self):
         """Properly disconnect from Telegram."""
         try:
+            self.shutdown_event.set()
+            await self.cleanup_incomplete_downloads()
             await self.client.disconnect()  # type: ignore
             self.logger.info("Disconnected from Telegram")
         except Exception as e:
