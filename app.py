@@ -375,6 +375,11 @@ class TelegramDownloader:
                         )
                         downloaded_files.append(file_path)
                         continue
+                    elif file_path.exists() and file_path.stat().st_size == 0:
+                        self.logger.info(
+                            f"File exists but is empty, removing: {message.file.name}"
+                        )
+                        file_path.unlink()
 
                     # Add download task to queue
                     await self.download_queue.put((message, file_path))
