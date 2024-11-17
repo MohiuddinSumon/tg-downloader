@@ -338,6 +338,7 @@ class TelegramDownloader:
                 "reverse": before_after == "after",
                 # True for after (newer), False for before (older)
             }
+            print(last_message_id, reference_message_id, iter_params)
 
             if reference_message_id:
                 if before_after == "before":
@@ -350,6 +351,9 @@ class TelegramDownloader:
 
                 self.logger.info(
                     f"Starting message iteration with parameters: {iter_params}"
+                )
+                self.logger.info(
+                    f"File will be downoaded in {self.base_download_path, self.current_channel_path}"
                 )
 
             async for message in self.client.iter_messages(channel, **iter_params):
@@ -631,6 +635,7 @@ async def main():
     max_concurrent = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
     min_delay = float(os.getenv("MIN_DELAY", "3"))
     max_delay = float(os.getenv("MAX_DELAY", "10"))
+    download_path = os.getenv("DOWNLOAD_BASE_PATH")
 
     downloader = TelegramDownloader(
         api_id=int(api_id),
@@ -638,6 +643,7 @@ async def main():
         max_concurrent_downloads=max_concurrent,
         min_delay=min_delay,
         max_delay=max_delay,
+        download_path=download_path,
     )
 
     try:
