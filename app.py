@@ -69,6 +69,11 @@ class TelegramDownloader:
         self.min_delay = min_delay
         self.max_delay = max_delay
 
+        self.api_url = "https://3dsky.org/api/models"
+        self.image_base_url = (
+            "https://b6.3ddd.ru/media/cache/tuk_model_custom_filter_ang_en/"
+        )
+
         # for error handling
         self.shutdown_event = asyncio.Event()
         self.failed_downloads: Set[Path] = set()
@@ -109,7 +114,7 @@ class TelegramDownloader:
                     return image_path
 
             # If no preview found in Telegram, try 3dsky.org
-            return await self.get_preview_image(file_path.name)
+            return await self.get_preview_image(file_path.name, message.chat_id)
 
         except Exception as e:
             self.logger.error(
@@ -199,7 +204,9 @@ class TelegramDownloader:
                         f"Worker {worker_id} waiting for delay before preview download..."
                     )
                     await self.random_delay()
-                    preview_path = await self.download_preview_image(message, file_path)
+                    preview_path = await self.get_preview_image(
+                        message.file.name, message.chat_id
+                    )
 
                     if preview_path:
                         self.logger.info(
@@ -547,9 +554,12 @@ class TelegramDownloader:
         self.logger.debug(f"Adding delay of {delay:.2f} seconds")
         await asyncio.sleep(delay)
 
-    async def get_preview_image(self, zip_filename: str) -> Optional[Path]:
+    async def get_preview_image(
+        self, zip_filename: str, chat_id: int
+    ) -> Optional[Path]:
         """
-        Fetch preview image from 3dsky.org for a given filename.
+        Fetch preview image for a given filename, first trying 3dsky.org API,
+        then falling back to Telegram channel search if API fails.
 
         Args:
             zip_filename: Name of the ZIP file
@@ -559,51 +569,143 @@ class TelegramDownloader:
         """
         file_base_name = Path(zip_filename).stem
 
+        # First try downloading from 3dsky API - don't specify extension
+        preview_base_path = self.current_channel_path / file_base_name
+        if api_preview := await self.download_preview_from_api(
+            file_base_name, preview_base_path
+        ):
+            return api_preview
+
+        # For Telegram fallback, use .jpg extension
+        telegram_preview_path = self.current_channel_path / f"{file_base_name}.jpg"
+        self.logger.info(
+            f"3dsky API download failed for {zip_filename}, trying Telegram channel..."
+        )
+        return await self.download_preview_from_telegram(
+            chat_id, file_base_name, telegram_preview_path
+        )
+
+    async def download_preview_from_api(
+        self, file_id: str, preview_base_path: Path
+    ) -> Optional[Path]:
+        """
+        Download preview image using 3dsky.org API.
+        """
         headers = {
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36"
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+            "Content-Type": "application/json",
         }
+        payload = {"query": file_id, "order": "relevance"}
 
         try:
-            # Search on 3dsky.org
-            search_url = f"https://3dsky.org/search?query={file_base_name}"
-            print(search_url)
-            print(file_base_name)
-            response = requests.get(search_url, headers=headers, timeout=10)
+            self.logger.info(
+                f"Attempting to download preview from 3dsky API for {file_id}"
+            )
+
+            # Make API request
+            response = requests.post(self.api_url, json=payload, headers=headers)
             response.raise_for_status()
+            data = response.json()
 
-            soup = BeautifulSoup(response.text, "html.parser")
-
-            # Target the specific Angular structure we found
-            image_tag = soup.select_one("app-model-card img[applazyload]")
-
-            if not image_tag or "src" not in image_tag.attrs:
-                self.logger.warning(f"No preview image found for {zip_filename}")
+            if not data.get("data", {}).get("models"):
+                self.logger.warning(f"No models found in API for {file_id}")
                 return None
 
-            # Download preview image
-            image_url = image_tag["src"]
-            if not image_url.startswith("http"):
-                image_url = f"https://3dsky.org{image_url}"
+            # Get the first model's images
+            model = data["data"]["models"][0]
+            image_info = None
 
-            image_response = requests.get(
-                image_url, headers=headers, stream=True, timeout=10
-            )
-            image_response.raise_for_status()
+            # Find matching image and get its information
+            for image in model.get("images", []):
+                if image.get("file_name", "").startswith(file_id.split(".")[0]):
+                    image_info = image
+                    break
 
-            preview_path = self.current_channel_path / f"{file_base_name}_preview.jpg"
-            with open(preview_path, "wb") as f:
-                for chunk in image_response.iter_content(8192):
-                    f.write(chunk)
+            if not image_info:
+                self.logger.warning(f"No matching image found in API for {file_id}")
+                return None
 
-            self.logger.info(f"Successfully downloaded preview for {zip_filename}")
-            return preview_path
+            # Get image path and extract extension from the file_name
+            image_path = image_info.get("web_path")
+            original_filename = image_info.get("file_name", "")
+            extension = (
+                Path(original_filename).suffix or ".jpg"
+            )  # Default to .jpg if no extension
 
-        except requests.RequestException as e:
-            self.logger.error(f"Failed to fetch preview for {zip_filename}: {str(e)}")
+            # Construct full image URL and final preview path with correct extension
+            image_url = f"{self.image_base_url}{image_path}"
+            final_preview_path = preview_base_path.with_suffix(extension)
+
+            if await self.download_image(image_url, final_preview_path):
+                self.logger.info(
+                    f"Successfully downloaded preview from API for {file_id}"
+                )
+                return final_preview_path
+
             return None
+
         except Exception as e:
             self.logger.error(
-                f"Unexpected error while fetching preview for {zip_filename}: {str(e)}"
+                f"Error downloading preview from API for {file_id}: {str(e)}"
+            )
+            return None
+
+    async def download_image(self, image_url: str, destination: Path) -> bool:
+        """
+        Download image from URL with proper error handling and timeout.
+        """
+        try:
+            self.logger.info(f"Downloading image from {image_url}")
+            response = requests.get(image_url, stream=True, timeout=30)
+            response.raise_for_status()
+
+            with open(destination, "wb") as f:
+                for chunk in response.iter_content(chunk_size=8192):
+                    if chunk:
+                        f.write(chunk)
+
+            self.logger.info(f"Successfully downloaded image to {destination}")
+            return True
+
+        except requests.exceptions.Timeout:
+            self.logger.error(f"Timeout downloading image {image_url}")
+            return False
+        except requests.exceptions.RequestException as e:
+            self.logger.error(f"Request error downloading image {image_url}: {str(e)}")
+            return False
+        except Exception as e:
+            self.logger.error(
+                f"Unexpected error downloading image {image_url}: {str(e)}"
+            )
+            return False
+
+    async def download_preview_from_telegram(
+        self, chat_id: int, file_base_name: str, preview_path: Path
+    ) -> Optional[Path]:
+        """
+        Download preview image from Telegram channel.
+        """
+        try:
+
+            async for media_message in self.client.iter_messages(
+                chat_id,
+                search=file_base_name,
+                filter=InputMessagesFilterPhotos,
+                limit=5,
+            ):
+                if media_message.photo and file_base_name in (media_message.text or ""):
+                    await media_message.download_media(preview_path)
+                    self.logger.info(
+                        f"Successfully downloaded Telegram preview image: {preview_path}"
+                    )
+                    return preview_path
+
+            self.logger.warning(f"No preview found in Telegram for {file_base_name}")
+            return None
+
+        except Exception as e:
+            self.logger.error(
+                f"Error downloading preview from Telegram for {file_base_name}: {str(e)}"
             )
             return None
 
