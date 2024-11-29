@@ -20,8 +20,8 @@ if [ ! -d "$FOLDER_PATH" ]; then
 fi
 
 # List contents of current directory for debugging
-echo "Contents of current directory:"
-ls -la
+# echo "Contents of current directory:"
+# ls -la
 
 # Check if .venv directory exists
 if [ ! -d "$FOLDER_PATH/.venv" ]; then
