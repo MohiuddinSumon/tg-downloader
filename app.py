@@ -12,7 +12,6 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 
 import pytz
 import requests
-from bs4 import BeautifulSoup
 from dotenv import load_dotenv
 from telethon import TelegramClient, sync
 from telethon.tl.types import (
