@@ -78,12 +78,20 @@ class TelegramDownloader:
         self.failed_downloads: Set[Path] = set()
         self.in_progress_downloads: Dict[Path, datetime] = {}
 
-        # Setup logging
+        # Create logs directory
+        self.logs_path = self.base_download_path / "logs"
+        self.logs_path.mkdir(parents=True, exist_ok=True)
+
+        # Get today's log file name
+        today = datetime.now().strftime("%Y-%m-%d")
+        log_file = self.logs_path / f"downloader_{today}.log"
+
+        # Setup logging with daily log file
         logging.basicConfig(
             level=log_level,
             format="%(asctime)s - %(levelname)s - %(message)s",
             handlers=[
-                logging.FileHandler(self.base_download_path / "downloader.log"),
+                logging.FileHandler(log_file),
                 logging.StreamHandler(),
             ],
         )
@@ -377,12 +385,26 @@ class TelegramDownloader:
                             continue
 
                     file_path = self.current_channel_path / message.file.name
+                    preview_path = (
+                        self.current_channel_path
+                        / f"{Path(message.file.name).stem}.jpg"
+                    )
 
-                    # Skip if file already exists and non empty
+                    # Check if file exists and handle preview
                     if file_path.exists() and file_path.stat().st_size > 0:
-                        self.logger.info(
-                            f"File already exists, skipping: {message.file.name}"
-                        )
+                        self.logger.info(f"File exists: {message.file.name}")
+                        if not preview_path.exists():
+                            self.logger.info(
+                                f"Missing preview for existing file: {message.file.name}"
+                            )
+                            await self.random_delay()
+                            preview = await self.get_preview_image(
+                                message.file.name, message.chat_id
+                            )
+                            if preview:
+                                self.logger.info(
+                                    f"Downloaded missing preview: {preview}"
+                                )
                         downloaded_files.append(file_path)
                         continue
                     elif file_path.exists() and file_path.stat().st_size == 0:
