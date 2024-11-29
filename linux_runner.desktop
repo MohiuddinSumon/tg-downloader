@@ -1,6 +1,6 @@
 [Desktop Entry]
 Type=Application
-Name=Run My App
+Name=TG Downloader
 Comment=Run Python application with virtual environment
 Exec=/home/yourpath/tg-downloader/linux_runner.sh
 Terminal=true
