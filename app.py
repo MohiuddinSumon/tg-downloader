@@ -316,45 +316,52 @@ class TelegramDownloader:
                 worker = asyncio.create_task(self.download_worker(i + 1))
                 workers.append(worker)
 
-            # Get last download info
-            last_download = self.get_last_download_info()
-            last_message_id = last_download.get("message_id", 0)
+            # Get environment date filters
+            from_date_str = os.getenv("FROM_DATE")
+            to_date_str = os.getenv("TO_DATE")
 
-            # Handle file name filtering and reference point
             reference_message = None
             reference_message_id = None
+            offset_date = None
 
-            if file_name_filter:
-                self.logger.info(f"File name filter: {file_name_filter}")
+            # Priority 1: Date range from environment
+            if from_date_str and to_date_str:
+                from_date = datetime.fromisoformat(from_date_str).replace(
+                    tzinfo=pytz.UTC
+                )
+                to_date = datetime.fromisoformat(to_date_str).replace(tzinfo=pytz.UTC)
+                self.logger.info(f"Using date range filter: {from_date} to {to_date}")
+
+                # Use the appropriate date as offset based on direction
+                # offset_date is used to start the message iteration from
+                offset_date = to_date if before_after == "before" else from_date
+                self.logger.info(
+                    f"Using offset date: {offset_date} with direction: {before_after}"
+                )
+            # Priority 2: File name filter
+            elif file_name_filter:
+                self.logger.info(f"Using file name filter: {file_name_filter}")
                 reference_message, reference_message_id = (
                     await self.find_reference_message(channel, file_name_filter)
                 )
-                if reference_message_id is None:
-                    # If reference file not found, continue with normal processing
-                    self.logger.info(
-                        f"Did not find given message , Continuing with last download file : {last_download.get('file_name')}"
-                    )
-                    reference_message_id = last_message_id
-                else:
-                    self.logger.info(
-                        f"Found reference message ID: {reference_message_id}"
-                    )
-            else:
-                reference_message_id = last_message_id
 
-            if date_filter and date_filter.tzinfo is None:
-                date_filter = pytz.UTC.localize(date_filter)
+            # Priority 3: Last download information
+            else:
+                last_download = self.get_last_download_info()
+                # 0 is default value for message_id if no previous downloads
+                reference_message_id = last_download.get("message_id", 0)
+                before_after = last_download.get("direction_used", before_after)
 
             # Determine the correct message iteration parameters
             iter_params = {
                 "limit": limit,
                 "filter": InputMessagesFilterDocument,
                 "reverse": before_after == "after",
-                # True for after (newer), False for before (older)
             }
-            print(last_message_id, reference_message_id, iter_params)
 
-            if reference_message_id:
+            if offset_date:
+                iter_params["offset_date"] = offset_date
+            elif reference_message_id:
                 if before_after == "before":
                     # For "before", start from the reference ID and go backwards (older messages)
                     iter_params["offset_id"] = reference_message_id
@@ -363,12 +370,25 @@ class TelegramDownloader:
                     # We need to add 1 to offset_id to exclude the reference message itself
                     iter_params["offset_id"] = reference_message_id + 1
 
-                self.logger.info(
-                    f"Starting message iteration with parameters: {iter_params}"
-                )
-                self.logger.info(
-                    f"File will be downoaded in {self.base_download_path, self.current_channel_path}"
-                )
+            self.logger.info(
+                f"Starting message iteration with parameters: {iter_params}"
+            )
+
+            # Determine the correct message iteration parameters
+            iter_params = {
+                "limit": limit,
+                "filter": InputMessagesFilterDocument,
+                "reverse": before_after == "after",
+                # True for after (newer), False for before (older)
+            }
+            print(reference_message_id, iter_params)
+
+            self.logger.info(
+                f"Starting message iteration with parameters: {iter_params}"
+            )
+            self.logger.info(
+                f"File will be downoaded in {self.base_download_path, self.current_channel_path}"
+            )
 
             async for message in self.client.iter_messages(channel, **iter_params):
                 if self.shutdown_event.is_set():
@@ -376,18 +396,10 @@ class TelegramDownloader:
                     break
 
                 if message.file and message.file.name.endswith(".zip"):
-                    # Apply filters
-                    if date_filter:
-                        message_date = message.date.replace(tzinfo=pytz.UTC)
-                        if (before_after == "after" and message_date < date_filter) or (
-                            before_after == "before" and message_date > date_filter
-                        ):
-                            continue
-
                     file_path = self.current_channel_path / message.file.name
                     preview_path = (
                         self.current_channel_path
-                        / f"{Path(message.file.name).stem}.jpg"
+                        / f"{Path(message.file.name).stem}.jpeg"
                     )
 
                     # Check if file exists and handle preview
@@ -482,6 +494,9 @@ class TelegramDownloader:
             "message_id": message.id,
             "file_name": message.file.name if message.file else None,
             "downloaded_at": datetime.now().isoformat(),
+            "direction_used": os.getenv(
+                "BEFORE_AFTER", "before"
+            ),  # Changed to direction_used
         }
 
         with open(self.last_download_file, "w") as f:
