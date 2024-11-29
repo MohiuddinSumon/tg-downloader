@@ -324,7 +324,7 @@ class TelegramDownloader:
                 if reference_message_id is None:
                     # If reference file not found, continue with normal processing
                     self.logger.info(
-                        f"Did not find given message , Continuing with last download file : {last_download.get("file_name")}"
+                        f"Did not find given message , Continuing with last download file : {last_download.get('file_name')}"
                     )
                     reference_message_id = last_message_id
                 else:
@@ -733,9 +733,9 @@ async def main():
         api_hash = input("Enter your API HASH: ")
 
     # Configure number of concurrent downloads
-    max_concurrent = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", "3"))
-    min_delay = float(os.getenv("MIN_DELAY", "3"))
-    max_delay = float(os.getenv("MAX_DELAY", "10"))
+    max_concurrent = int(os.getenv("MAX_CONCURRENT_DOWNLOADS", 3))
+    min_delay = float(os.getenv("MIN_DELAY", 10))
+    max_delay = float(os.getenv("MAX_DELAY", 30))
     download_path = os.getenv("DOWNLOAD_BASE_PATH")
 
     downloader = TelegramDownloader(
