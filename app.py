@@ -665,7 +665,7 @@ class TelegramDownloader:
             image_path = image_info.get("web_path")
             original_filename = image_info.get("file_name", "")
             extension = (
-                Path(original_filename).suffixes[-1] or ".jpeg"
+                Path(image_path).suffixes[-1] or ".jpeg"
             )  # Default to .jpeg if no extension
 
             self.logger.info(
