@@ -668,6 +668,10 @@ class TelegramDownloader:
                 Path(original_filename).suffix or ".jpg"
             )  # Default to .jpg if no extension
 
+            self.logger.info(
+                f"image_path: {image_path}, original_filename: {original_filename}, extension: {extension}"
+            )
+
             # Construct full image URL and final preview path with correct extension
             image_url = f"{self.image_base_url}{image_path}"
             final_preview_path = preview_base_path.with_suffix(extension)
@@ -691,7 +695,7 @@ class TelegramDownloader:
         Download image from URL with proper error handling and timeout.
         """
         try:
-            self.logger.info(f"Downloading image from {image_url}")
+            self.logger.info(f"Downloading image from {image_url}, to {destination}")
             response = requests.get(image_url, stream=True, timeout=30)
             response.raise_for_status()
 
