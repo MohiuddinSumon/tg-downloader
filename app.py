@@ -437,7 +437,7 @@ class TelegramDownloader:
                     # Check if file exists and handle preview
                     if file_path.exists() and file_path.stat().st_size > 0:
                         self.logger.info(f"File exists: {message.file.name}")
-                        if not preview_path.exists():
+                        if not preview_path:
                             self.logger.info(
                                 f"Missing preview for existing file: {message.file.name}"
                             )
