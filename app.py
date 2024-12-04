@@ -414,10 +414,23 @@ class TelegramDownloader:
 
                 if message.file and message.file.name.endswith(compressed_extensions):
                     file_path = self.current_channel_path / message.file.name
-                    preview_path = (
+                    # Check for both .jpeg and .jpg extensions
+                    preview_path_jpeg = (
                         self.current_channel_path
                         / f"{Path(message.file.name).stem}.jpeg"
                     )
+                    preview_path_jpg = (
+                        self.current_channel_path
+                        / f"{Path(message.file.name).stem}.jpg"
+                    )
+
+                    # Check if either preview file exists
+                    if preview_path_jpeg.exists():
+                        preview_path = preview_path_jpeg
+                    elif preview_path_jpg.exists():
+                        preview_path = preview_path_jpg
+                    else:
+                        preview_path = None  # No preview found
 
                     # Check if file exists and handle preview
                     if file_path.exists() and file_path.stat().st_size > 0:
