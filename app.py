@@ -756,6 +756,21 @@ class TelegramDownloader:
                     )
                     return preview_path
 
+            # If not found, check the previous and next messages
+            async for media_message in self.client.iter_messages(
+                chat_id,
+                limit=10,  # Check a few messages before and after
+            ):
+                # Check if the message is one before or after the current one
+                if media_message.photo and (
+                    file_base_name.lower() in (media_message.text or "").lower()
+                ):
+                    await media_message.download_media(preview_path)
+                    self.logger.info(
+                        f"Successfully downloaded Telegram preview image from nearby message: {preview_path}"
+                    )
+                    return preview_path
+
             self.logger.warning(f"No preview found in Telegram for {file_base_name}")
             return None
 
