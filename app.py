@@ -98,6 +98,7 @@ class TelegramDownloader:
         self.logger = logging.getLogger(__name__)
         self.client = TelegramClient(session_name, api_id, api_hash)
 
+    # Not used
     async def download_preview_image(
         self, message: Message, file_path: Path
     ) -> Optional[Path]:
@@ -623,6 +624,10 @@ class TelegramDownloader:
 
         # First try downloading from 3dsky API - don't specify extension
         preview_base_path = self.current_channel_path / file_base_name
+        print(
+            f"Preview Base Path {preview_base_path}, File Base Name = {file_base_name} Zip Filename {zip_filename}"
+        )
+
         if api_preview := await self.download_preview_from_api(
             file_base_name, preview_base_path
         ):
