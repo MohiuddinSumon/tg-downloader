@@ -624,7 +624,7 @@ class TelegramDownloader:
 
         # First try downloading from 3dsky API - don't specify extension
         preview_base_path = self.current_channel_path / file_base_name
-        print(
+        self.logger.info(
             f"Preview Base Path {preview_base_path}, File Base Name = {file_base_name} Zip Filename {zip_filename}"
         )
 
@@ -696,6 +696,7 @@ class TelegramDownloader:
             # Construct full image URL and final preview path with correct extension
             image_url = f"{self.image_base_url}{image_path}"
             final_preview_path = preview_base_path.with_suffix(extension)
+            self.logger.info(f"FInal Preview PATH = {final_preview_path}")
 
             if await self.download_image(image_url, final_preview_path):
                 self.logger.info(
