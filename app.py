@@ -390,12 +390,28 @@ class TelegramDownloader:
                 f"File will be downoaded in {self.base_download_path, self.current_channel_path}"
             )
 
+            compressed_extensions = (
+                ".zip",
+                ".rar",
+                ".7z",
+                ".tar",
+                ".tar.gz",
+                ".tgz",
+                ".tar.bz2",
+                ".tbz",
+                ".gz",
+                ".bz2",
+                ".xz",
+                ".zipx",
+                ".z",
+            )
+
             async for message in self.client.iter_messages(channel, **iter_params):
                 if self.shutdown_event.is_set():
                     self.logger.info("Shutdown event detected during message iteration")
                     break
 
-                if message.file and message.file.name.endswith(".zip"):
+                if message.file and message.file.name.endswith(compressed_extensions):
                     file_path = self.current_channel_path / message.file.name
                     preview_path = (
                         self.current_channel_path
