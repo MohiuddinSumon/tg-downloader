@@ -194,7 +194,9 @@ class TelegramDownloader:
                         )
 
                     # Download to temporary file first (, progress_callback=progress_callback)
-                    await message.download_media(temp_file_path)
+                    await message.download_media(
+                        temp_file_path, progress_callback=progress_callback
+                    )
 
                     # Verify the download
                     if (
