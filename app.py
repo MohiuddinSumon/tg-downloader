@@ -1,4 +1,5 @@
 import asyncio
+import io
 import json
 import logging
 import os
@@ -13,11 +14,19 @@ from typing import Dict, List, Optional, Set, Tuple, Union
 import pytz
 import requests
 from dotenv import load_dotenv
-from telethon import TelegramClient, sync
+from PIL import Image
+from telethon import TelegramClient, events, sync
+from telethon.errors import (
+    ChatAdminRequiredError,
+    FileReferenceExpiredError,
+    MediaEmptyError,
+)
+from telethon.tl.functions.messages import SearchRequest
 from telethon.tl.types import (
     InputMessagesFilterDocument,
     InputMessagesFilterPhotos,
     Message,
+    MessageMediaPhoto,
 )
 
 # pylint: disable=W1203
@@ -67,6 +76,7 @@ class TelegramDownloader:
         self.active_downloads: Set[Task] = set()
         self.min_delay = min_delay
         self.max_delay = max_delay
+        self.preview_direction = os.getenv("PREVIEW_DIRECTION", "up").lower()
 
         self.api_url = "https://3dsky.org/api/models"
         self.image_base_url = (
@@ -442,13 +452,26 @@ class TelegramDownloader:
                                 f"Missing preview for existing file: {message.file.name}"
                             )
                             await self.random_delay()
-                            preview = await self.get_preview_image(
-                                message.file.name, message.chat_id
+
+                            # Previous Version
+                            # preview = await self.get_preview_image(
+                            #     message.file.name, message.chat_id
+                            # )
+                            # if preview:
+                            #     self.logger.info(
+                            #         f"Downloaded missing preview: {preview}"
+                            #     )
+
+                            # New Version
+                            preview = await self.download_preview_from_telegram(
+                                message.chat_id,
+                                Path(message.file.name).stem,
+                                preview_path_jpeg,  # passing path to save here ?
+                                message,
                             )
                             if preview:
-                                self.logger.info(
-                                    f"Downloaded missing preview: {preview}"
-                                )
+                                downloaded_files.append(preview)
+
                         downloaded_files.append(file_path)
                         continue
                     elif file_path.exists() and file_path.stat().st_size == 0:
@@ -754,43 +777,165 @@ class TelegramDownloader:
             )
             return False
 
-    async def download_preview_from_telegram(
-        self, chat_id: int, file_base_name: str, preview_path: Path
-    ) -> Optional[Path]:
+    async def find_associated_preview(
+        self, message: Message, direction: str = "up"
+    ) -> Optional[Message]:
         """
-        Download preview image from Telegram channel.
+        Find the associated preview image message for a compressed file.
+        Looks for the immediate message before or after based on direction.
         """
         try:
+            offset = -1 if direction == "up" else 1
+            adjacent_message = await self.client.get_messages(
+                message.chat_id,
+                limit=1,
+                offset_id=message.id,
+                reverse=(direction == "down"),
+            )
 
-            async for media_message in self.client.iter_messages(
-                chat_id,
-                search=file_base_name,
-                filter=InputMessagesFilterPhotos,
-                limit=5,
-            ):
-                if media_message.photo and file_base_name in (media_message.text or ""):
-                    await media_message.download_media(preview_path)
+            if adjacent_message and len(adjacent_message) > 0:
+                msg = adjacent_message[0]
+                if msg.photo:
+                    return msg
+            return None
+
+        except Exception as e:
+            self.logger.error(f"Error finding associated preview: {str(e)}")
+            return None
+
+    async def handle_multipart_files(self, message: Message) -> bool:
+        """
+        Check if the message contains multiple compressed files.
+        Returns True if it's a multipart message.
+        """
+        if not message.file:
+            return False
+
+        # Common multipart indicators in filename
+        multipart_patterns = ["part", "vol", "volume", "cd"]
+        filename_lower = message.file.name.lower()
+
+        # Check message text for multiple file references
+        message_text = message.text.lower() if message.text else ""
+        has_multiple_files = (
+            "files:" in message_text
+            or "parts:" in message_text
+            or any(pattern in filename_lower for pattern in multipart_patterns)
+        )
+
+        return has_multiple_files
+
+    async def capture_photo_preview(
+        self, message: Message, preview_path: Path
+    ) -> Optional[Path]:
+        """Capture preview when download is restricted."""
+        try:
+            if not message.media or not isinstance(message.media, MessageMediaPhoto):
+                return None
+
+            # # Get the photo in memory
+            # photo_data = await message.download_media(bytes)
+            # if not photo_data:
+            #     return None
+
+            # Use the client's download_media method instead
+            photo_data = await self.client.download_media(message.media, bytes)
+            if not photo_data:
+                return None
+
+            # Convert bytes to image
+            image = Image.open(io.BytesIO(photo_data))
+
+            # Save the image
+            image.save(preview_path)
+            self.logger.info(f"Successfully captured preview: {preview_path}")
+            return preview_path
+
+        except Exception as e:
+            self.logger.error(f"Error capturing preview: {str(e)}")
+            return None
+
+    async def download_preview_from_telegram(
+        self, chat_id: int, file_base_name: str, preview_path: Path, message: Message
+    ) -> Optional[Path]:
+        """
+        Enhanced preview download handling for all scenarios.
+        """
+        try:
+            # Check if it's a multipart file
+            is_multipart = await self.handle_multipart_files(message)
+
+            # Find associated preview based on direction
+            preview_message = await self.find_associated_preview(
+                message, self.preview_direction
+            )
+
+            if preview_message:
+                try:
+                    # Try direct download first
+                    await self.client.download_media(
+                        preview_message.photo, preview_path
+                    )
                     self.logger.info(
-                        f"Successfully downloaded Telegram preview image: {preview_path}"
+                        f"Successfully downloaded associated preview: {preview_path}"
                     )
                     return preview_path
 
-            # If not found, check the previous and next messages
-            async for media_message in self.client.iter_messages(
-                chat_id,
-                limit=10,  # Check a few messages before and after
-            ):
-                # Check if the message is one before or after the current one
-                if media_message.photo and (
-                    file_base_name.lower() in (media_message.text or "").lower()
+                except (
+                    ChatAdminRequiredError,
+                    FileReferenceExpiredError,
+                    MediaEmptyError,
+                ) as e:
+                    # If direct download fails, try to get full resolution photo
+                    try:
+                        # Get the largest photo size available
+                        photo = preview_message.photo
+                        if photo and photo.sizes:
+                            # largest_size = max(photo.sizes, key=lambda x: x.size)
+                            photo_data = await self.client.download_file(
+                                photo.id, file=bytes
+                            )
+
+                            if photo_data:
+                                # Save the photo
+                                with open(preview_path, "wb") as f:
+                                    f.write(photo_data)
+                                self.logger.info(
+                                    f"Successfully saved full resolution preview: {preview_path}"
+                                )
+                                return preview_path
+                    except Exception as e:
+                        self.logger.error(
+                            f"Error getting full resolution photo: {str(e)}"
+                        )
+                        return None
+
+            # If no preview found with direct adjacent message
+            if not preview_message and not is_multipart:
+                # Try searching by filename as fallback
+                async for media_message in self.client.iter_messages(
+                    chat_id,
+                    search=file_base_name,
+                    filter=InputMessagesFilterPhotos,
+                    limit=3,
                 ):
-                    await media_message.download_media(preview_path)
-                    self.logger.info(
-                        f"Successfully downloaded Telegram preview image from nearby message: {preview_path}"
-                    )
-                    return preview_path
+                    if media_message.photo:
+                        try:
+                            await self.client.download_media(
+                                media_message.photo, preview_path
+                            )
+                            self.logger.info(
+                                f"Successfully downloaded preview by filename: {preview_path}"
+                            )
+                            return preview_path
+                        except (
+                            ChatAdminRequiredError,
+                            FileReferenceExpiredError,
+                            MediaEmptyError,
+                        ):
+                            continue
 
-            self.logger.warning(f"No preview found in Telegram for {file_base_name}")
+            self.logger.warning(f"No preview found for {file_base_name}")
             return None
 
         except Exception as e:
