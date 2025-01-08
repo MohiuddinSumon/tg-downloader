@@ -108,38 +108,6 @@ class TelegramDownloader:
         self.logger = logging.getLogger(__name__)
         self.client = TelegramClient(session_name, api_id, api_hash)
 
-    # Not used
-    async def download_preview_image(
-        self, message: Message, file_path: Path
-    ) -> Optional[Path]:
-        """Download preview image from the message or from 3dsky.org."""
-        base_filename = file_path.stem
-
-        try:
-            # First try to find preview in Telegram
-            async for media_message in self.client.iter_messages(
-                message.chat_id,
-                search=base_filename,
-                filter=InputMessagesFilterPhotos,
-                limit=5,
-            ):
-                if media_message.photo and base_filename in (media_message.text or ""):
-                    image_path = file_path.parent / f"{base_filename}.jpg"
-                    await media_message.download_media(image_path)
-                    self.logger.info(
-                        f"Successfully downloaded Telegram preview image: {image_path}"
-                    )
-                    return image_path
-
-            # If no preview found in Telegram, try 3dsky.org
-            return await self.get_preview_image(file_path.name, message.chat_id)
-
-        except Exception as e:
-            self.logger.error(
-                f"Error downloading preview image for {base_filename}: {str(e)}"
-            )
-            return None
-
     async def cleanup_incomplete_downloads(self):
         """Clean up any incomplete or zero-byte downloads."""
         if not self.current_channel_path:
@@ -224,9 +192,7 @@ class TelegramDownloader:
                         f"Worker {worker_id} waiting for delay before preview download..."
                     )
                     await self.random_delay()
-                    preview_path = await self.get_preview_image(
-                        message.file.name, message.chat_id
-                    )
+                    preview_path = await self.get_preview_image(message)
 
                     if preview_path:
                         self.logger.info(
@@ -454,23 +420,21 @@ class TelegramDownloader:
                             await self.random_delay()
 
                             # Previous Version
-                            # preview = await self.get_preview_image(
-                            #     message.file.name, message.chat_id
-                            # )
-                            # if preview:
-                            #     self.logger.info(
-                            #         f"Downloaded missing preview: {preview}"
-                            #     )
+                            preview_downloaded = await self.get_preview_image(message)
+                            if preview_downloaded:
+                                self.logger.info(
+                                    f"Downloaded missing preview: {preview_downloaded}"
+                                )
 
                             # New Version
-                            preview = await self.download_preview_from_telegram(
-                                message.chat_id,
-                                Path(message.file.name).stem,
-                                preview_path_jpeg,  # passing path to save here ?
-                                message,
-                            )
-                            if preview:
-                                downloaded_files.append(preview)
+                            # preview = await self.download_preview_from_telegram(
+                            #     message.chat_id,
+                            #     Path(message.file.name).stem,
+                            #     preview_path_jpeg,  # passing path to save here ?
+                            #     message,
+                            # )
+                            # if preview:
+                            #     downloaded_files.append(preview)
 
                         downloaded_files.append(file_path)
                         continue
@@ -645,9 +609,7 @@ class TelegramDownloader:
         self.logger.debug(f"Adding delay of {delay:.2f} seconds")
         await asyncio.sleep(delay)
 
-    async def get_preview_image(
-        self, zip_filename: str, chat_id: int
-    ) -> Optional[Path]:
+    async def get_preview_image(self, message: Message) -> Optional[Path]:
         """
         Fetch preview image for a given filename, first trying 3dsky.org API,
         then falling back to Telegram channel search if API fails.
@@ -658,6 +620,9 @@ class TelegramDownloader:
         Returns:
             Path to saved preview image if successful, None otherwise
         """
+        zip_filename = message.file.name
+        chat_id = message.chat_id
+
         file_base_name = Path(zip_filename).stem
 
         # First try downloading from 3dsky API - don't specify extension
@@ -669,12 +634,17 @@ class TelegramDownloader:
             return api_preview
 
         # For Telegram fallback, use .jpg extension
-        telegram_preview_path = self.current_channel_path / f"{file_base_name}.jpg"
+        telegram_preview_download_path = (
+            self.current_channel_path / f"{file_base_name}.jpg"
+        )
         self.logger.info(
             f"3dsky API download failed for {zip_filename}, trying Telegram channel..."
         )
         return await self.download_preview_from_telegram(
-            chat_id, file_base_name, telegram_preview_path
+            chat_id,
+            file_base_name,
+            telegram_preview_download_path,
+            message,
         )
 
     async def download_preview_from_api(
@@ -856,7 +826,7 @@ class TelegramDownloader:
             return None
 
     async def download_preview_from_telegram(
-        self, chat_id: int, file_base_name: str, preview_path: Path, message: Message
+        self, chat_id: int, file_base_name: str, download_path: Path, message: Message
     ) -> Optional[Path]:
         """
         Enhanced preview download handling for all scenarios.
@@ -874,12 +844,12 @@ class TelegramDownloader:
                 try:
                     # Try direct download first
                     await self.client.download_media(
-                        preview_message.photo, preview_path
+                        preview_message.photo, download_path
                     )
                     self.logger.info(
-                        f"Successfully downloaded associated preview: {preview_path}"
+                        f"Successfully downloaded associated preview: {download_path}"
                     )
-                    return preview_path
+                    return download_path
 
                 except (
                     ChatAdminRequiredError,
@@ -898,12 +868,12 @@ class TelegramDownloader:
 
                             if photo_data:
                                 # Save the photo
-                                with open(preview_path, "wb") as f:
+                                with open(download_path, "wb") as f:
                                     f.write(photo_data)
                                 self.logger.info(
-                                    f"Successfully saved full resolution preview: {preview_path}"
+                                    f"Successfully saved full resolution preview: {download_path}"
                                 )
-                                return preview_path
+                                return download_path
                     except Exception as e:
                         self.logger.error(
                             f"Error getting full resolution photo: {str(e)}"
@@ -922,12 +892,12 @@ class TelegramDownloader:
                     if media_message.photo:
                         try:
                             await self.client.download_media(
-                                media_message.photo, preview_path
+                                media_message.photo, download_path
                             )
                             self.logger.info(
-                                f"Successfully downloaded preview by filename: {preview_path}"
+                                f"Successfully downloaded preview by filename: {download_path}"
                             )
-                            return preview_path
+                            return download_path
                         except (
                             ChatAdminRequiredError,
                             FileReferenceExpiredError,
@@ -935,7 +905,7 @@ class TelegramDownloader:
                         ):
                             continue
 
-            self.logger.warning(f"No preview found for {file_base_name}")
+            self.logger.warning(f"No preview found for {file_base_name} in Telegram")
             return None
 
         except Exception as e:
