@@ -88,6 +88,10 @@ class TelegramDownloader:
         self.failed_downloads: Set[Path] = set()
         self.in_progress_downloads: Dict[Path, datetime] = {}
 
+        # for date filtering
+        self.date_from: Optional[datetime] = None
+        self.date_to: Optional[datetime] = None
+
         # Create logs directory
         self.logs_path = self.base_download_path / "logs"
         self.logs_path.mkdir(parents=True, exist_ok=True)
@@ -305,18 +309,41 @@ class TelegramDownloader:
 
             # Priority 1: Date range from environment
             if from_date_str and to_date_str:
-                from_date = datetime.fromisoformat(from_date_str).replace(
-                    tzinfo=pytz.UTC
-                )
-                to_date = datetime.fromisoformat(to_date_str).replace(tzinfo=pytz.UTC)
-                self.logger.info(f"Using date range filter: {from_date} to {to_date}")
+                try:
+                    from_date = datetime.fromisoformat(from_date_str).replace(
+                        tzinfo=pytz.UTC
+                    )
+                    to_date = datetime.fromisoformat(to_date_str).replace(
+                        tzinfo=pytz.UTC
+                    )
 
-                # Use the appropriate date as offset based on direction
-                # offset_date is used to start the message iteration from
-                offset_date = to_date if before_after == "before" else from_date
-                self.logger.info(
-                    f"Using offset date: {offset_date} with direction: {before_after}"
-                )
+                    # Validate date range
+                    if from_date >= to_date:
+                        self.logger.error(
+                            f"Invalid date range: FROM_DATE ({from_date}) must be before TO_DATE ({to_date})"
+                        )
+                        raise ValueError("FROM_DATE must be before TO_DATE")
+
+                    self.logger.info(
+                        f"Using date range filter: {from_date} to {to_date}"
+                    )
+
+                    # Store date range for filtering during iteration
+                    self.date_from = from_date
+                    self.date_to = to_date
+
+                    # Use the appropriate date as offset based on direction
+                    # offset_date is used to start the message iteration from
+                    offset_date = to_date if before_after == "before" else from_date
+                    self.logger.info(
+                        f"Using offset date: {offset_date} with direction: {before_after}"
+                    )
+                except ValueError as e:
+                    self.logger.error(f"Invalid date format: {str(e)}")
+                    self.logger.error(
+                        "Expected format: YYYY-MM-DD or YYYY-MM-DDTHH:MM:SS"
+                    )
+                    raise
             # Priority 2: File name filter
             elif file_name_filter:
                 self.logger.info(f"Using file name filter: {file_name_filter}")
@@ -352,21 +379,11 @@ class TelegramDownloader:
             self.logger.info(
                 f"Starting message iteration with parameters: {iter_params}"
             )
-
-            # Determine the correct message iteration parameters
-            iter_params = {
-                "limit": limit,
-                "filter": InputMessagesFilterDocument,
-                "reverse": before_after == "after",
-                # True for after (newer), False for before (older)
-            }
-            print(reference_message_id, iter_params)
-
-            self.logger.info(
-                f"Starting message iteration with parameters: {iter_params}"
+            print(
+                f"Reference message ID: {reference_message_id}, Iter params: {iter_params}"
             )
             self.logger.info(
-                f"File will be downoaded in {self.base_download_path, self.current_channel_path}"
+                f"File will be downloaded in {self.base_download_path, self.current_channel_path}"
             )
 
             compressed_extensions = (
@@ -389,6 +406,19 @@ class TelegramDownloader:
                 if self.shutdown_event.is_set():
                     self.logger.info("Shutdown event detected during message iteration")
                     break
+
+                # Apply date range filtering if FROM_DATE and TO_DATE are set
+                if hasattr(self, "date_from") and hasattr(self, "date_to"):
+                    message_date = message.date.replace(tzinfo=pytz.UTC)
+                    if not (self.date_from <= message_date <= self.date_to):
+                        self.logger.debug(
+                            f"Skipping message {message.id} from {message_date} - outside date range"
+                        )
+                        continue
+                    else:
+                        self.logger.debug(
+                            f"Message {message.id} from {message_date} is within date range"
+                        )
 
                 if message.file and message.file.name.endswith(compressed_extensions):
                     file_path = self.current_channel_path / message.file.name
